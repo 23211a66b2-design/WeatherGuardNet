@@ -1,171 +1,585 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
-from ultralytics import YOLO
+import time
 import tempfile
 import os
+from PIL import Image
+from ultralytics import YOLO
 
-# ----------------------------
-# Page config
-# ----------------------------
-st.set_page_config(page_title="WeatherGuard YOLO", layout="wide")
-st.title("WeatherGuard – Adaptive Video Object Detection")
+# -------------------------------------------------------
+# STREAMLIT PAGE CONFIG
+# -------------------------------------------------------
+st.set_page_config(
+    page_title="WeatherGuard",
+    layout="wide"
+)
 
-# ----------------------------
-# Device (FORCE CPU FOR CLOUD)
-# ----------------------------
-device = "cpu"
-st.sidebar.write("Device: CPU")
+st.title("🌦️ WeatherGuard – Adaptive Object Detection")
+st.write(
+    "Weather-aware object detection using image restoration "
+    "and YOLOv8."
+)
 
-# ----------------------------
-# Load model once
-# ----------------------------
+# -------------------------------------------------------
+# MODEL LOADING
+# -------------------------------------------------------
 @st.cache_resource
 def load_model():
     return YOLO("yolov8n.pt")
 
-model = load_model()
 
-# ----------------------------
-# Image restoration
-# ----------------------------
-def anti_glare_restoration(img_pil):
-    img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR).astype(np.float32) / 255.0
-    img = np.minimum(img, 0.95) / 0.95
-    img = np.power(img, 0.9)
-    img = (img * 255).astype(np.uint8)
+yolo_model = load_model()
 
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    clahe = cv2.createCLAHE(3.0, (8, 8))
-    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-    img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+# -------------------------------------------------------
+# IMAGE RESTORATION PIPELINE
+# -------------------------------------------------------
+def anti_glare_restoration(
+    img_pil: Image.Image,
+    upsample: bool = False
+):
 
-    img = cv2.bilateralFilter(img, 7, 70, 70)
-    blur = cv2.GaussianBlur(img, (0, 0), 1.2)
-    img = cv2.addWeighted(img, 1.35, blur, -0.35, 0)
+    img_np = np.array(img_pil)
 
-    return img
+    if img_np.size == 0:
+        return img_pil, np.zeros(
+            (1, 1, 3),
+            dtype=np.uint8
+        )
 
-# ----------------------------
-# Adaptation engine
-# ----------------------------
-def adaptation_engine(env):
-    if env == "clear":
-        return 0.7, 50
-    if env == "rainy":
-        return 0.4, 30
-    if env == "foggy":
-        return 0.35, 70
-    if env == "glare":
-        return 0.6, 100
-    return 0.25, 0
+    # RGB -> BGR
+    img_cv = cv2.cvtColor(
+        img_np,
+        cv2.COLOR_RGB2BGR
+    ).astype(np.float32) / 255.0
 
-# ----------------------------
-# Detection
-# ----------------------------
-def detect(frame, conf, min_area):
-    results = model(frame, conf=conf, device="cpu", verbose=False)
-    out = frame.copy()
+    # ---------------------------------------------------
+    # Optional Upsampling
+    # ---------------------------------------------------
+    if upsample:
 
-    if results and results[0].boxes is not None:
-        for x1, y1, x2, y2, score, cls in results[0].boxes.data.tolist():
-            area = (x2 - x1) * (y2 - y1)
-            if area < min_area:
+        h, w = img_cv.shape[:2]
+
+        img_cv = cv2.resize(
+            img_cv,
+            (
+                int(w * 1.25),
+                int(h * 1.25)
+            ),
+            interpolation=cv2.INTER_CUBIC
+        )
+
+    # ---------------------------------------------------
+    # Highlight / Glare Suppression
+    # ---------------------------------------------------
+    clip_val = 0.95
+
+    img_clipped = np.minimum(
+        img_cv,
+        clip_val
+    ) / clip_val
+
+    img_clipped = np.clip(
+        img_clipped,
+        0,
+        1
+    )
+
+    # ---------------------------------------------------
+    # Gamma Correction
+    # ---------------------------------------------------
+    gamma = 0.9
+
+    img_gamma = np.power(
+        img_clipped,
+        gamma
+    )
+
+    img_8u = np.clip(
+        img_gamma * 255,
+        0,
+        255
+    ).astype(np.uint8)
+
+    # ---------------------------------------------------
+    # CLAHE
+    # ---------------------------------------------------
+    lab = cv2.cvtColor(
+        img_8u,
+        cv2.COLOR_BGR2LAB
+    )
+
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=3.0,
+        tileGridSize=(8, 8)
+    )
+
+    l_eq = clahe.apply(l)
+
+    lab_eq = cv2.merge(
+        (l_eq, a, b)
+    )
+
+    img_eq = cv2.cvtColor(
+        lab_eq,
+        cv2.COLOR_LAB2BGR
+    )
+
+    # ---------------------------------------------------
+    # Denoising
+    # ---------------------------------------------------
+    img_den = cv2.bilateralFilter(
+        img_eq,
+        d=7,
+        sigmaColor=70,
+        sigmaSpace=70
+    )
+
+    # ---------------------------------------------------
+    # Sharpening
+    # ---------------------------------------------------
+    blur = cv2.GaussianBlur(
+        img_den,
+        (0, 0),
+        sigmaX=1.2
+    )
+
+    img_sharp = cv2.addWeighted(
+        img_den,
+        1.35,
+        blur,
+        -0.35,
+        0
+    )
+
+    # BGR -> RGB
+    final_pil = Image.fromarray(
+        cv2.cvtColor(
+            img_sharp,
+            cv2.COLOR_BGR2RGB
+        )
+    )
+
+    return final_pil, img_sharp
+
+
+# -------------------------------------------------------
+# ADAPTATION ENGINE
+# -------------------------------------------------------
+def adaptation_engine(condition):
+
+    conf = 0.25
+    min_bbox_area = 0
+
+    if condition == "clear":
+
+        conf = 0.70
+        min_bbox_area = 50
+
+    elif condition == "rainy":
+
+        conf = 0.40
+        min_bbox_area = 30
+
+    elif condition == "foggy":
+
+        conf = 0.35
+        min_bbox_area = 70
+
+    elif condition == "glare":
+
+        conf = 0.60
+        min_bbox_area = 100
+
+    return conf, min_bbox_area
+
+
+# -------------------------------------------------------
+# OBJECT DETECTION
+# -------------------------------------------------------
+def supervised_object_detection(
+    model,
+    img_bgr,
+    conf,
+    min_bbox_area
+):
+
+    results = model(
+        img_bgr,
+        conf=conf,
+        verbose=False
+    )
+
+    output = img_bgr.copy()
+
+    detections = []
+
+    if results and results[0].boxes:
+
+        for box in results[0].boxes.data.tolist():
+
+            x1, y1, x2, y2, score, cls = box
+
+            # Bounding box area
+            area = (
+                (x2 - x1) *
+                (y2 - y1)
+            )
+
+            # Remove very small boxes
+            if area < min_bbox_area:
                 continue
 
-            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            detections.append(box)
+
+            x1, y1, x2, y2 = map(
+                int,
+                [x1, y1, x2, y2]
+            )
+
             label = model.names[int(cls)]
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # Draw bounding box
+            cv2.rectangle(
+                output,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2
+            )
+
+            # Draw label
             cv2.putText(
-                out,
+                output,
                 f"{label} {score:.2f}",
-                (x1, y1 - 8),
+                (x1, max(0, y1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (255, 255, 255),
-                2,
+                2
             )
-    return out
 
-# ----------------------------
-# Sidebar controls
-# ----------------------------
-st.sidebar.header("Controls")
-environment = st.sidebar.selectbox(
-    "Environment",
-    ["clear", "rainy", "foggy", "glare"]
-)
-start = st.sidebar.button("Start Processing")
+    return output, detections
 
-# ----------------------------
-# Upload
-# ----------------------------
-video_file = st.file_uploader("Upload a video", type=["mp4", "avi", "mov"])
 
-# ----------------------------
-# Processing
-# ----------------------------
-if video_file and start:
-    conf, min_area = adaptation_engine(environment)
+# -------------------------------------------------------
+# VIDEO PROCESSING
+# -------------------------------------------------------
+def process_video(
+    video_path,
+    condition,
+    show_stream
+):
 
-    st.write(f"Confidence: {conf}")
-    st.write(f"Min bbox area: {min_area}")
+    cap = cv2.VideoCapture(video_path)
 
-    temp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    if not cap.isOpened():
 
-    temp_in.write(video_file.read())
-    temp_in.close()
+        st.error("Could not open video.")
 
-    cap = cv2.VideoCapture(temp_in.name)
+        return None
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps == 0:
-        fps = 25
-
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    writer = cv2.VideoWriter(
-        temp_out.name,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (w, h)
+    # Video properties
+    fps = cap.get(
+        cv2.CAP_PROP_FPS
     )
 
-    frame_box = st.empty()
+    width = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_WIDTH
+        )
+    )
 
+    height = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_HEIGHT
+        )
+    )
+
+    total_frames = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_COUNT
+        )
+    )
+
+    if fps <= 0:
+        fps = 30
+
+    # ---------------------------------------------------
+    # Output video path
+    # ---------------------------------------------------
+    output_path = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".mp4"
+    ).name
+
+    # Try mp4 codec
+    fourcc = cv2.VideoWriter_fourcc(
+        *"mp4v"
+    )
+
+    writer = cv2.VideoWriter(
+        output_path,
+        fourcc,
+        fps,
+        (width, height)
+    )
+
+    # ---------------------------------------------------
+    # UI placeholders
+    # ---------------------------------------------------
+    frame_placeholder = st.empty()
+
+    progress_bar = st.progress(0)
+
+    status_text = st.empty()
+
+    # ---------------------------------------------------
+    # Adaptation parameters
+    # ---------------------------------------------------
+    conf, min_area = adaptation_engine(
+        condition
+    )
+
+    st.info(
+        f"Condition: *{condition}* | "
+        f"Confidence: *{conf}* | "
+        f"Minimum Box Area: *{min_area}*"
+    )
+
+    processed = 0
+    total_detections = 0
+
+    start = time.time()
+
+    # ---------------------------------------------------
+    # Frame processing loop
+    # ---------------------------------------------------
     while cap.isOpened():
+
         ret, frame = cap.read()
+
         if not ret:
             break
 
-        pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        restored = anti_glare_restoration(pil)
-        detected = detect(restored, conf, min_area)
-
-        writer.write(detected)
-        frame_box.image(
-            cv2.cvtColor(detected, cv2.COLOR_BGR2RGB),
-            use_container_width=True
+        # ------------------------------------------------
+        # Convert frame to PIL
+        # ------------------------------------------------
+        pil = Image.fromarray(
+            cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
+            )
         )
 
+        # ------------------------------------------------
+        # Image restoration
+        # ------------------------------------------------
+        _, restored = anti_glare_restoration(
+            pil
+        )
+
+        # ------------------------------------------------
+        # YOLO detection
+        # ------------------------------------------------
+        detected, detections = (
+            supervised_object_detection(
+                yolo_model,
+                restored,
+                conf,
+                min_area
+            )
+        )
+
+        total_detections += len(
+            detections
+        )
+
+        # ------------------------------------------------
+        # Write frame to output video
+        # ------------------------------------------------
+        writer.write(detected)
+
+        # ------------------------------------------------
+        # Live preview
+        # ------------------------------------------------
+        if show_stream and processed % 3 == 0:
+
+            rgb = cv2.cvtColor(
+                detected,
+                cv2.COLOR_BGR2RGB
+            )
+
+            frame_placeholder.image(
+                rgb,
+                use_container_width=True
+            )
+
+        # ------------------------------------------------
+        # Progress
+        # ------------------------------------------------
+        processed += 1
+
+        if total_frames > 0:
+
+            progress = (
+                processed /
+                total_frames
+            )
+
+            progress_bar.progress(
+                min(progress, 1.0)
+            )
+
+        status_text.text(
+            f"Processing frame "
+            f"{processed}/{total_frames}"
+        )
+
+    # ---------------------------------------------------
+    # Cleanup
+    # ---------------------------------------------------
     cap.release()
     writer.release()
 
-    st.success("Processing complete")
+    elapsed = time.time() - start
 
-    with open(temp_out.name, "rb") as f:
-        st.download_button(
-            "Download processed video",
-            f,
-            file_name="weatherguard_output.mp4",
-            mime="video/mp4"
+    progress_bar.progress(1.0)
+
+    status_text.success(
+        f"Completed! {processed} frames processed "
+        f"in {elapsed:.2f} seconds."
+    )
+
+    st.success(
+        f"Total detections: {total_detections}"
+    )
+
+    return output_path
+
+
+# -------------------------------------------------------
+# STREAMLIT UI
+# -------------------------------------------------------
+
+st.sidebar.header("⚙️ Settings")
+
+condition = st.sidebar.selectbox(
+    "Environmental Condition",
+    [
+        "clear",
+        "rainy",
+        "foggy",
+        "glare"
+    ]
+)
+
+show_stream = st.sidebar.checkbox(
+    "Live Preview",
+    value=True
+)
+
+st.subheader("📹 Upload Video")
+
+uploaded_video = st.file_uploader(
+    "Upload a video",
+    type=[
+        "mp4",
+        "avi",
+        "mov"
+    ]
+)
+
+# -------------------------------------------------------
+# Show selected condition
+# -------------------------------------------------------
+if condition == "clear":
+
+    st.info(
+        "☀️ Clear: Higher confidence threshold "
+        "for reliable detections."
+    )
+
+elif condition == "rainy":
+
+    st.info(
+        "🌧️ Rainy: Lower confidence threshold "
+        "to detect objects affected by rain."
+    )
+
+elif condition == "foggy":
+
+    st.info(
+        "🌫️ Foggy: Lower confidence threshold "
+        "to compensate for reduced visibility."
+    )
+
+elif condition == "glare":
+
+    st.info(
+        "💡 Glare: Higher confidence and "
+        "larger minimum bounding box."
+    )
+
+
+# -------------------------------------------------------
+# Process uploaded video
+# -------------------------------------------------------
+if uploaded_video:
+
+    st.video(
+        uploaded_video
+    )
+
+    if st.button(
+        "🚀 Run WeatherGuard",
+        type="primary"
+    ):
+
+        # Save uploaded video
+        input_file = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".mp4"
         )
 
-    os.remove(temp_in.name)
-    os.remove(temp_out.name)
+        input_file.write(
+            uploaded_video.read()
+        )
 
-else:
-    st.info("Upload a video and click Start Processing.")
+        input_file.close()
+
+        # Process
+        output_path = process_video(
+            input_file.name,
+            condition,
+            show_stream
+        )
+
+        # ------------------------------------------------
+        # Download output
+        # ------------------------------------------------
+        if output_path and os.path.exists(
+            output_path
+        ):
+
+            st.subheader(
+                "🎥 Processed Video"
+            )
+
+            st.video(
+                output_path
+            )
+
+            with open(
+                output_path,
+                "rb"
+            ) as video_file:
+
+                st.download_button(
+                    label="⬇️ Download Processed Video",
+                    data=video_file,
+                    file_name="weatherguard_output.mp4",
+                    mime="video/mp4"
+                )
